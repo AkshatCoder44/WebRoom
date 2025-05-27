@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>T-Room Monsoon Update</title>
+  <style>
+    video {
+      width: 320px;
+      height: 240px;
+      border: 1px solid #ccc;
+      margin: 5px;
+      background-color: black;
+    }
+    button {
+      margin: 5px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Join a Room</h1>
+  <input id="roomName" placeholder="Room name" />
+  <button id="joinBtn">Join</button>
+
+  <div id="shareButtons" style="display:none;">
+    <button id="shareCamBtn">Share Camera</button>
+    <button id="shareScreenBtn">Share Screen</button>
+    <button id="stopStreamBtn" style="display:none;">Stop Streaming</button>
+  </div>
+
+  <h2>Status: <span id="status">Not connected</span></h2>
+
+  <div id="videos"></div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const socket = io();
+
+    let localStream = null;
+    let peers = {}; // peerId -> RTCPeerConnection
+    let roomName = '';
+    let isStreaming = false;
+    let currentStreamerId = null; // socket id of current streamer
+
+    const videosDiv = document.getElementById('videos');
+    const statusSpan = document.getElementById('status');
+    const roomInput = document.getElementById('roomName');
+    const joinBtn = document.getElementById('joinBtn');
+    const shareButtonsDiv = document.getElementById('shareButtons');
+    const shareCamBtn = document.getElementById('shareCamBtn');
+    const shareScreenBtn = document.getElementById('shareScreenBtn');
+    const stopStreamBtn = document.getElementById('stopStreamBtn');
+
+    joinBtn.onclick = () => {
+      const room = roomInput.value.trim();
+      if (!room) return alert('Enter a room name');
+      roomName = room;
+      socket.emit('join-room', roomName, (response) => {
+        statusSpan.textContent = `Joined room "${roomName}"`;
+        shareButtonsDiv.style.display = 'block';
+      });
+    };
+
+    shareCamBtn.onclick = async () => {
+      if (isStreaming) {
+        alert('Already streaming');
+        return;
+      }
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        await startStreaming(stream);
+      } catch (err) {
+        alert('Camera access error: ' + err.message);
+      }
+    };
+
+    shareScreenBtn.onclick = async () => {
+      if (isStreaming) {
+        alert('Already streaming');
+        return;
+      }
+      try {
+        const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+        // Add mic audio if available
+        let finalStream = screenStream;
+        try {
+          const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          const combinedStream = new MediaStream();
+
+          screenStream.getTracks().forEach(t => combinedStream.addTrack(t));
+          micStream.getAudioTracks().forEach(t => combinedStream.addTrack(t));
+
+          finalStream = combinedStream;
+        } catch (micErr) {
+          console.warn('No mic audio included:', micErr);
+        }
+        await startStreaming(finalStream);
+      } catch (err) {
+        alert('Screen share error: ' + err.message);
+      }
+    };
+
+    stopStreamBtn.onclick = () => {
+      if (!isStreaming) return;
+      stopStreaming();
+    };
+
+    async function startStreaming(stream) {
+      stopStreamAndClearVideos(); // Cleanup previous streams if any
+      localStream = stream;
+      isStreaming = true;
+      currentStreamerId = socket.id;
+
+      addVideoElement('localVideo', true, localStream);
+      showStopButton(true);
+      statusSpan.textContent = 'You are streaming';
+
+      socket.emit('start-streaming', roomName);
+
+      // For each viewer, create/update peer connection
+      for (const peerId in peers) {
+        const pc = peers[peerId];
+        // Remove old senders
+        pc.getSenders().forEach(sender => {
+          if (sender.track && (sender.track.kind === 'video' || sender.track.kind === 'audio')) {
+            pc.removeTrack(sender);
+          }
+        });
+        // Add tracks from local stream
+        localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        socket.emit('signal', { to: peerId, data: { description: pc.localDescription } });
+      }
+
+      // Handle local stream end (if user stops sharing from browser UI)
+      stream.getVideoTracks()[0].onended = () => {
+        stopStreaming();
+      };
+    }
+
+    function stopStreaming() {
+      if (!isStreaming) return;
+
+      socket.emit('stop-streaming', roomName);
+      stopStreamAndClearVideos();
+
+      // Close all peer connections
+      for (const id in peers) {
+        peers[id].close();
+        delete peers[id];
+      }
+
+      statusSpan.textContent = 'Stopped streaming';
+      showStopButton(false);
+      currentStreamerId = null;
+    }
+
+    function stopStreamAndClearVideos() {
+      // Stop local stream tracks
+      if (localStream) {
+        localStream.getTracks().forEach(t => t.stop());
+        localStream = null;
+      }
+      isStreaming = false;
+      showStopButton(false);
+
+      // Remove local video element
+      removeVideoElement('localVideo');
+
+      // Stop remote video tracks and remove element
+      const remoteVideo = document.getElementById('remoteVideo');
+      if (remoteVideo) {
+        if (remoteVideo.srcObject) {
+          remoteVideo.srcObject.getTracks().forEach(t => t.stop());
+        }
+        removeVideoElement('remoteVideo');
+      }
+    }
+
+    function addVideoElement(id, isLocal, stream) {
+      let video = document.getElementById(id);
+      if (!video) {
+        video = document.createElement('video');
+        video.id = id;
+        video.autoplay = true;
+        video.playsInline = true;
+        video.muted = isLocal; // mute local video to avoid echo
+        videosDiv.appendChild(video);
+      }
+      video.srcObject = stream || null;
+      video.play().catch(e => {
+        if (e.name !== 'AbortError') {
+          console.warn('Video play() failed:', e);
+        }
+      });
+    }
+
+    function removeVideoElement(id) {
+      const el = document.getElementById(id);
+      if (el) {
+        el.remove();
+      }
+    }
+
+    function showStopButton(show) {
+      stopStreamBtn.style.display = show ? 'inline-block' : 'none';
+    }
+
+    function createPeerConnection(peerId) {
+      const pc = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      });
+
+      pc.onicecandidate = e => {
+        if (e.candidate) {
+          socket.emit('signal', { to: peerId, data: { candidate: e.candidate } });
+        }
+      };
+
+      pc.ontrack = e => {
+        // Only viewers get remote streams displayed
+        if (socket.id !== currentStreamerId) {
+          addVideoElement('remoteVideo', false, e.streams[0]);
+          statusSpan.textContent = 'Viewing stream';
+        }
+      };
+
+      peers[peerId] = pc;
+      return pc;
+    }
+
+    socket.on('new-peer', async (peerId) => {
+      if (socket.id === currentStreamerId) {
+        // Sharer side: create peer connection and add local stream tracks
+        const pc = createPeerConnection(peerId);
+        if (localStream) {
+          localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+        }
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        socket.emit('signal', { to: peerId, data: { description: pc.localDescription } });
+      } else {
+        // Viewer side: create peer connection (answer later)
+        createPeerConnection(peerId);
+      }
+    });
+
+    socket.on('signal', async ({ from, data }) => {
+      if (!peers[from]) {
+        peers[from] = createPeerConnection(from);
+      }
+      const pc = peers[from];
+
+      if (data.description) {
+        await pc.setRemoteDescription(new RTCSessionDescription(data.description));
+        if (data.description.type === 'offer') {
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          socket.emit('signal', { to: from, data: { description: pc.localDescription } });
+        }
+      } else if (data.candidate) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+        } catch (e) {
+          console.error('Error adding ICE candidate', e);
+        }
+      }
+    });
+
+    socket.on('streamer-started', (streamerId) => {
+      currentStreamerId = streamerId;
+      if (socket.id === streamerId) {
+        // I started streaming
+        statusSpan.textContent = 'You are streaming';
+        showStopButton(true);
+      } else {
+        // Another started streaming
+        statusSpan.textContent = 'Viewing stream';
+        showStopButton(false);
+
+        // Clear local video (if any)
+        removeVideoElement('localVideo');
+      }
+    });
+
+    socket.on('streaming-stopped', () => {
+      stopStreamAndClearVideos();
+      statusSpan.textContent = 'Streamer stopped';
+      showStopButton(false);
+      currentStreamerId = null;
+    });
+
+    socket.on('peer-left', (peerId) => {
+      if (peers[peerId]) {
+        peers[peerId].close();
+        delete peers[peerId];
+      }
+      if (socket.id !== currentStreamerId) {
+        // Clear remote video if peer who was streaming left
+        removeVideoElement('remoteVideo');
+      }
+    });
+  </script>
+</body>
+</html>
